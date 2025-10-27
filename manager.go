@@ -14,12 +14,10 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
-const (
-	DefaultCachePath = "./.models/"
-)
-
 var (
-	ErrNoneCached = errors.New("no cached models")
+	// overridable via env NSFW_MODEL_CACHE_DIR
+	DefaultCachePath = envStr("NSFW_MODEL_CACHE_DIR", "./.models/")
+	ErrNoneCached    = errors.New("no cached models")
 )
 
 type releaseInfo struct {
@@ -30,6 +28,25 @@ type releaseInfo struct {
 		Name        string `json:"name"`
 		DownloadURL string `json:"browser_download_url"`
 	} `json:"assets"`
+}
+
+// Hard fallback (from your screenshot)
+func defaultFallbackRelease() releaseInfo {
+	tag := envStr("NSFW_MODEL_FALLBACK_TAG", "1.2.0")
+	name := envStr("NSFW_MODEL_FALLBACK_NAME", "mobilenet_v2_140_224.1.zip")
+	url := envStr("NSFW_MODEL_FALLBACK_URL",
+		"https://github.com/GantMan/nsfw_model/releases/download/1.2.0/mobilenet_v2_140_224.1.zip")
+
+	return releaseInfo{
+		TagName: tag,
+		Assets: []struct {
+			ID          int    `json:"id"`
+			Name        string `json:"name"`
+			DownloadURL string `json:"browser_download_url"`
+		}{
+			{ID: 0, Name: name, DownloadURL: url},
+		},
+	}
 }
 
 func getLatestCached(folder string) (releaseInfo, error) {
@@ -43,25 +60,21 @@ func getLatestCached(folder string) (releaseInfo, error) {
 		if !file.IsDir() {
 			continue
 		}
-
 		if latest.isOlderDir(file.Name()) {
 			latest = releaseInfo{
-				LocalPath: folder + file.Name(),
+				LocalPath: filepath.Join(folder, file.Name()),
 				TagName:   file.Name(),
 			}
-			// Only get partial data until we make sure that it's the latest model
 		}
 	}
-
 	if latest.TagName == "0" {
 		return releaseInfo{}, ErrNoneCached
 	}
 
-	info, err := parseReleaseInfoFile(latest.LocalPath + "/meta.json")
+	info, err := parseReleaseInfoFile(filepath.Join(latest.LocalPath, "meta.json"))
 	if err != nil {
 		return releaseInfo{}, err
 	}
-
 	info.LocalPath = latest.LocalPath
 	return info, nil
 }
@@ -71,7 +84,6 @@ func parseReleaseInfoFile(filename string) (releaseInfo, error) {
 	if err != nil {
 		return releaseInfo{}, err
 	}
-
 	defer f.Close()
 
 	data, err := ioutil.ReadAll(f)
@@ -89,23 +101,32 @@ func parseReleaseInfoFile(filename string) (releaseInfo, error) {
 }
 
 func getLatestReleaseInfo() (releaseInfo, error) {
-	resp, err := http.Get("https://api.github.com/repos/GantMan/nsfw_model/releases/latest")
-	if err != nil {
-		return releaseInfo{}, err
+	// if skipping remote, return fallback immediately
+	if envBool("NSFW_MODEL_SKIP_REMOTE") {
+		return defaultFallbackRelease(), nil
 	}
 
-	var body []byte
-	body, err = ioutil.ReadAll(resp.Body)
+	resp, err := http.Get("https://api.github.com/repos/GantMan/nsfw_model/releases/latest")
 	if err != nil {
-		return releaseInfo{}, err
+		// no network? use fallback
+		return defaultFallbackRelease(), nil
+	}
+	defer resp.Body.Close()
+
+	// rate-limited or other non-200? use fallback
+	if resp.StatusCode != http.StatusOK {
+		return defaultFallbackRelease(), nil
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return defaultFallbackRelease(), nil
 	}
 
 	var info releaseInfo
-	err = jsoniter.Unmarshal(body, &info)
-	if err != nil {
-		return releaseInfo{}, err
+	if err := jsoniter.Unmarshal(body, &info); err != nil {
+		return defaultFallbackRelease(), nil
 	}
-
 	return info, nil
 }
 
@@ -114,37 +135,37 @@ func (i releaseInfo) getTagPath() string {
 }
 
 func (i releaseInfo) getModelPath() Path {
-	innerFolder := strings.TrimSuffix(i.Assets[0].Name, ".1.zip")
-	return i.getModelFolder() + Path(innerFolder)
+	// asset name is "... .zip"; the folder is same minus ".zip"
+	inner := strings.TrimSuffix(i.Assets[0].Name, ".zip")
+	// legacy compat: some used ".1.zip"
+	inner = strings.TrimSuffix(inner, ".1")
+	return i.getModelFolder() + Path(inner)
 }
 
 func (i releaseInfo) getModelFolder() Path {
-	return Path(i.LocalPath + "/model/")
+	return Path(filepath.Join(i.LocalPath, "model") + string(os.PathSeparator))
 }
 
 func (i releaseInfo) getZipPath() Path {
-	return Path(i.LocalPath + "/model.zip")
+	return Path(filepath.Join(i.LocalPath, "model.zip"))
 }
 
 func (i releaseInfo) getMetaPath() Path {
-	return Path(i.LocalPath + "/meta.json")
+	return Path(filepath.Join(i.LocalPath, "meta.json"))
 }
 
 func (i releaseInfo) isNewer(than releaseInfo) bool {
 	if than.TagName == "" {
 		return true
 	}
-
 	tag1, _ := strconv.Atoi(strings.ReplaceAll(i.TagName, ".", ""))
 	tag2, _ := strconv.Atoi(strings.ReplaceAll(than.TagName, ".", ""))
-
 	return tag1 > tag2
 }
 
 func (i releaseInfo) isOlderDir(than string) bool {
 	tag1, _ := strconv.Atoi(strings.ReplaceAll(i.TagName, ".", ""))
 	tag2, _ := strconv.Atoi(strings.ReplaceAll(than, "_", ""))
-
 	return tag1 < tag2
 }
 
@@ -152,12 +173,10 @@ func (i releaseInfo) download(filename Path) error {
 	if len(i.Assets) == 0 {
 		return fmt.Errorf("no assets for release '%s'", i.TagName)
 	}
-
 	if !strings.HasSuffix(string(filename), ".zip") {
 		filename += ".zip"
 	}
-
-	if err := os.MkdirAll(filepath.Dir(string(filename)), 0770); err != nil {
+	if err := os.MkdirAll(filepath.Dir(string(filename)), 0o770); err != nil {
 		return err
 	}
 
@@ -165,7 +184,6 @@ func (i releaseInfo) download(filename Path) error {
 	if err != nil {
 		return err
 	}
-
 	defer out.Close()
 
 	resp, err := http.Get(i.Assets[0].DownloadURL)
@@ -173,17 +191,11 @@ func (i releaseInfo) download(filename Path) error {
 		return err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
-
 	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (i releaseInfo) saveMeta(filename Path) error {
@@ -191,18 +203,12 @@ func (i releaseInfo) saveMeta(filename Path) error {
 	if err != nil {
 		return err
 	}
-
 	defer out.Close()
 
 	data, err := jsoniter.Marshal(i)
 	if err != nil {
 		return err
 	}
-
 	_, err = out.Write(data)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
