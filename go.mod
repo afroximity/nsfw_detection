@@ -1,4 +1,4 @@
-module github.com/ccuetoh/nsfw
+module github.com/afroximity/nsfw_detection
 
 go 1.18
 
