@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/ccuetoh/nsfw"
+	"github.com/afroximity/nsfw_detection"
 
 	"github.com/sirupsen/logrus"
 )
